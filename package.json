@@ -1,0 +1,33 @@
+{
+  "name": "rinha_backend_2025",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "tsc",
+    "run": "node dist/index.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/flaviorv/rinha_backend_2025.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/flaviorv/rinha_backend_2025/issues"
+  },
+  "homepage": "https://github.com/flaviorv/rinha_backend_2025#readme",
+  "dependencies": {
+    "@hono/node-server": "^1.15.0",
+    "decimal.js": "^10.6.0",
+    "hono": "^4.8.4",
+    "ioredis": "^5.6.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.17",
+    "tsx": "^4.7.1",
+    "typescript": "^5.8.3"
+  }
+}

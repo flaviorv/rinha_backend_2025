@@ -1,0 +1,31 @@
+version: '3.8'
+services:
+  hono-app:
+    networks:
+      - backend
+      - payment-processor
+    build: .
+    ports:
+      - "9999:3000"
+    environment:
+      NODE_ENV: production
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: ["redis-server", "--appendonly", "yes"]
+    restart: unless-stopped
+    networks:
+      - backend
+
+volumes:
+  redis-data:
+
+networks:
+  backend:
+    driver: bridge
+  payment-processor:
+    external: True
