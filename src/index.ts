@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
-import Redis from "ioredis";
+import Redis, { Redis as RedisClient } from "ioredis";
 import { Decimal } from "decimal.js";
 
 type Payment = {
@@ -9,25 +9,50 @@ type Payment = {
 };
 
 async function main() {
-  const redis = new Redis("redis://redis:6379");
+  interface CustomRedis extends RedisClient {
+    dedupCheck: (key: string, value: string) => Promise<number>;
+  }
+  const redis = new Redis("redis://redis:6379") as CustomRedis;
+  redis.defineCommand("dedupCheck", {
+    numberOfKeys: 1,
+    lua: `
+      if redis.call("SISMEMBER", KEYS[1], ARGV[1]) == 1 then
+          return 0
+      else
+          redis.call("SADD", KEYS[1], ARGV[1])
+          return 1
+      end
+    `,
+  });
   const app = new Hono();
   await redis.lpush("waiting", "initializing");
   await redis.rpop("waiting");
 
+  const PROCESSOR: string[] = ["default", "fallback"];
+  const processorStatus: Record<string, boolean> = {
+    default: false,
+    fallback: false,
+  };
+
+  checkProcessor(PROCESSOR[0]);
+  await new Promise((resolve) => setTimeout(resolve, 2525));
+  checkProcessor(PROCESSOR[1]);
+
   async function processPayment(processor: string, payment: Payment) {
+    const dedupResult = await redis.dedupCheck("payments:processed", payment.correlationId);
+    if (dedupResult === 0) {
+      return new Response("Duplicate payment", { status: 409 });
+    }
     const currentDate = new Date();
-    const response = await fetch(
-      `http://payment-processor-${processor}:8080/payments`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          correlationId: payment.correlationId,
-          amount: payment.amount,
-          requestedAt: currentDate.toISOString(),
-        }),
-      }
-    );
+    const response = await fetch(`http://payment-processor-${processor}:8080/payments`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        correlationId: payment.correlationId,
+        amount: payment.amount,
+        requestedAt: currentDate.toISOString(),
+      }),
+    });
     if (response.ok) {
       await redis.zadd(
         `payment:${processor}`,
@@ -37,49 +62,57 @@ async function main() {
     }
     return response;
   }
-  const PROCESSORS = ["default", "fallback"];
-  let interval: any = undefined;
+
   app.post("/payments", async (c) => {
     const body = await c.req.json<Payment>();
-    console.log(await redis.llen("waiting"))
-    if (await redis.llen("waiting") === 0) {
-      for (const processor of PROCESSORS) {
-        const res = await processPayment(processor, body);
-        if (res.ok) {
-          return res;
-        }
+    if (processorStatus[PROCESSOR[0]]) {
+      const res = await processPayment(PROCESSOR[0], body);
+      if (res.ok) {
+        return res;
       }
     }
-    await redis.lpush("waiting", `${body.correlationId}:${body.amount}`);
-    if (interval === undefined) {
-      processQueuePayments();
+    if (processorStatus[PROCESSOR[1]]) {
+      const res = await processPayment(PROCESSOR[1], body);
+      if (res.ok) {
+        return res;
+      }
     }
+    processorStatus[PROCESSOR[0]] = false;
+    processorStatus[PROCESSOR[1]] = false;
+    await redis.lpush("waiting", `${body.correlationId}:${body.amount}`);
   });
 
-  async function processQueuePayments() {
-    interval = setInterval(async () => {
+  async function checkProcessor(processor: string) {
+    setInterval(async () => {
+      const res = await fetch(`http://payment-processor-${processor}:8080/payments/service-health`);
+      const body = await res.json();
+      if (body.failure === true) {
+        processorStatus[processor] = false;
+      } else {
+        processorStatus[processor] = true;
+        processQueuePayments(processor);
+      }
+    }, 5050);
+  }
+
+  const isProcessingQueue: Record<string, boolean> = {};
+  async function processQueuePayments(processor: string) {
+    if (isProcessingQueue[processor]) return;
+    isProcessingQueue[processor] = true;
+    while (processorStatus[processor]) {
       const item = await redis.rpop("waiting");
       if (!item) {
-        clearInterval(interval);
-        interval = undefined;
+        isProcessingQueue[processor] = false;
         return;
       }
-      const [_correlationId, _amount] = item.split(':');
+      const [_correlationId, _amount] = item!.split(":");
       const payment: Payment = {
         correlationId: _correlationId,
         amount: Number(_amount),
       };
-      for (const processor of PROCESSORS) {
-        const res = await processPayment(processor, payment);
-        if (res.ok) {
-          return res;
-        } 
-      }
-      await redis.rpush(
-        "waiting",
-        `${payment.correlationId}:${payment.amount}`
-      );
-    }, 15);
+      await processPayment(processor, payment);
+    }
+    isProcessingQueue[processor] = false;
   }
 
   app.get("/payments-summary", async (c) => {
@@ -88,8 +121,7 @@ async function main() {
     if (!from || !to) return c.text("Missing from or to query parameters", 400);
     const fromTimestamp = new Date(from).getTime();
     const toTimestamp = new Date(to).getTime();
-    if (isNaN(fromTimestamp) || isNaN(toTimestamp))
-      return c.text("Invalid date format", 400);
+    if (isNaN(fromTimestamp) || isNaN(toTimestamp)) return c.text("Invalid date format", 400);
     const defaultPayments = await redis.zrangebyscore(
       "payment:default",
       fromTimestamp,
@@ -142,10 +174,7 @@ async function main() {
     );
     const defaultBody = await defaultResponse.json();
     const fallbackBody = await fallbackResponse.json();
-    return c.json(
-      { default: defaultBody, fallback: fallbackBody },
-      { status: 200 }
-    );
+    return c.json({ default: defaultBody, fallback: fallbackBody }, { status: 200 });
   });
 
   app.post("/purge-payments", async () => {
