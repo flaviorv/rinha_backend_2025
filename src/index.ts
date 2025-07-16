@@ -29,17 +29,36 @@ async function main() {
   await redis.rpop("waiting");
 
   const PROCESSOR: string[] = ["default", "fallback"];
-  const processorStatus: Record<string, boolean> = {
-    default: false,
-    fallback: false,
+
+  const isEnabled: Record<string, boolean> = {
+    default: true,
+    fallback: true,
   };
 
   checkProcessor(PROCESSOR[0]);
   await new Promise((resolve) => setTimeout(resolve, 2525));
   checkProcessor(PROCESSOR[1]);
 
+  app.post("/payments", async (c) => {
+    const body = await c.req.json<Payment>();
+    if (isEnabled[PROCESSOR[0]]) {
+      const res = await processPayment(PROCESSOR[0], body);
+      if (res.ok || res.status === 409) {
+        return res;
+      }
+    }
+    if (isEnabled[PROCESSOR[1]]) {
+      const res = await processPayment(PROCESSOR[1], body);
+      if (res.ok || res.status === 409) {
+        return res;
+      }
+    }
+    await redis.lpush("waiting", `${body.correlationId}:${body.amount}`);
+    return c.json("Queued", 202);
+  });
+
   async function processPayment(processor: string, payment: Payment) {
-    const dedupResult = await redis.dedupCheck("payments:processed", payment.correlationId);
+    const dedupResult = await redis.dedupCheck("processed", payment.correlationId);
     if (dedupResult === 0) {
       return new Response("Duplicate payment", { status: 409 });
     }
@@ -55,42 +74,58 @@ async function main() {
     });
     if (response.ok) {
       await redis.zadd(
-        `payment:${processor}`,
+        `${processor}`,
         currentDate.getTime(),
         `${payment.correlationId}:${payment.amount}`
       );
+    } else {
+      isEnabled[processor] = false;
+      await redis.srem("processed", payment.correlationId);
     }
     return response;
   }
 
-  app.post("/payments", async (c) => {
-    const body = await c.req.json<Payment>();
-    if (processorStatus[PROCESSOR[0]]) {
-      const res = await processPayment(PROCESSOR[0], body);
-      if (res.ok) {
-        return res;
-      }
+  async function processQueuePayment(processor: string, payment: Payment) {
+    const dedupResult = await redis.dedupCheck("processed", payment.correlationId);
+    if (dedupResult === 0) {
+      return new Response("Duplicate payment", { status: 409 });
     }
-    if (processorStatus[PROCESSOR[1]]) {
-      const res = await processPayment(PROCESSOR[1], body);
-      if (res.ok) {
-        return res;
-      }
+    const currentDate = new Date();
+    const response = await fetch(`http://payment-processor-${processor}:8080/payments`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        correlationId: payment.correlationId,
+        amount: payment.amount,
+        requestedAt: currentDate.toISOString(),
+      }),
+    });
+    if (response.ok) {
+      await redis.zadd(
+        `${processor}`,
+        currentDate.getTime(),
+        `${payment.correlationId}:${payment.amount}`
+      );
+    } else {
+      isEnabled[processor] = false;
+      await redis.srem("processed", payment.correlationId);
+      await redis.rpush("waiting", `${payment.correlationId}:${payment.amount}`);
     }
-    processorStatus[PROCESSOR[0]] = false;
-    processorStatus[PROCESSOR[1]] = false;
-    await redis.lpush("waiting", `${body.correlationId}:${body.amount}`);
-  });
+    return response;
+  }
 
   async function checkProcessor(processor: string) {
     setInterval(async () => {
       const res = await fetch(`http://payment-processor-${processor}:8080/payments/service-health`);
       const body = await res.json();
-      if (body.failure === true) {
-        processorStatus[processor] = false;
+      if (body.failing) {
+        isEnabled[processor] = false;
       } else {
-        processorStatus[processor] = true;
-        processQueuePayments(processor);
+        isEnabled[processor] = true;
+        const queueLen = await redis.llen("waiting");
+        if (queueLen !== 0) {
+          processQueuePayments(processor);
+        }
       }
     }, 5050);
   }
@@ -99,7 +134,7 @@ async function main() {
   async function processQueuePayments(processor: string) {
     if (isProcessingQueue[processor]) return;
     isProcessingQueue[processor] = true;
-    while (processorStatus[processor]) {
+    while (isEnabled[processor]) {
       const item = await redis.rpop("waiting");
       if (!item) {
         isProcessingQueue[processor] = false;
@@ -110,7 +145,7 @@ async function main() {
         correlationId: _correlationId,
         amount: Number(_amount),
       };
-      await processPayment(processor, payment);
+      await processQueuePayment(processor, payment);
     }
     isProcessingQueue[processor] = false;
   }
@@ -122,21 +157,13 @@ async function main() {
     const fromTimestamp = new Date(from).getTime();
     const toTimestamp = new Date(to).getTime();
     if (isNaN(fromTimestamp) || isNaN(toTimestamp)) return c.text("Invalid date format", 400);
-    const defaultPayments = await redis.zrangebyscore(
-      "payment:default",
-      fromTimestamp,
-      toTimestamp
-    );
+    const defaultPayments = await redis.zrangebyscore(PROCESSOR[0], fromTimestamp, toTimestamp);
     const totalRequestsDefault = defaultPayments.length;
     const totalAmountDefault = defaultPayments.reduce(
       (sum: Decimal, val: string) => sum.plus(Decimal(val.split(":")[1])),
       new Decimal(0)
     );
-    const fallbackPayments = await redis.zrangebyscore(
-      "payment:fallback",
-      fromTimestamp,
-      toTimestamp
-    );
+    const fallbackPayments = await redis.zrangebyscore(PROCESSOR[1], fromTimestamp, toTimestamp);
     const totalRequestsFallback = fallbackPayments.length;
     const totalAmountFallback = fallbackPayments.reduce(
       (sum: Decimal, val: string) => sum.plus(Decimal(val.split(":")[1])),
