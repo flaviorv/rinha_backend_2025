@@ -1,14 +1,24 @@
-version: '3.8'
+version: "3.8"
 services:
-  hono-app:
+  hono-app-1:
     networks:
       - backend
       - payment-processor
     build: .
     ports:
-      - "9999:3000"
+      - "8501:3000"
     environment:
       NODE_ENV: production
+  hono-app-2:
+    networks:
+      - backend
+      - payment-processor
+    build: .
+    ports:
+      - "8500:3000"
+    environment:
+      NODE_ENV: production
+
   redis:
     image: redis:7
     container_name: redis
@@ -20,6 +30,24 @@ services:
     restart: unless-stopped
     networks:
       - backend
+
+  load-balancer:
+    container_name: load-balancer-nginx
+    image: nginx:1.27.1-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - hono-app-1
+      - hono-app-2
+    ports:
+      - "9999:9999"
+    networks:
+      - backend
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: "50MB"
 
 volumes:
   redis-data:
